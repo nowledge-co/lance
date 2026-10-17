@@ -3198,13 +3198,19 @@ impl Scanner {
             .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
             .await?;
         match index {
-            Some(index) => match &index.fragment_bitmap {
-                Some(fragmap) => {
+            Some(index) => {
+                // A logical FTS index can contain multiple committed delta
+                // segments. Execution searches all of them, so its prefilter
+                // must admit rows from their complete fragment union too.
+                let segments = self.dataset.load_indices_by_name(&index.name).await?;
+                for segment in &segments {
+                    let Some(fragmap) = &segment.fragment_bitmap else {
+                        return Ok(false);
+                    };
                     *accum |= fragmap;
-                    Ok(true)
                 }
-                None => Ok(false),
-            },
+                Ok(!segments.is_empty())
+            }
             None => Ok(false),
         }
     }
@@ -5373,7 +5379,10 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+    use lance_index::scalar::inverted::query::{
+        BooleanQuery, MatchQuery, MultiMatchQuery, PhraseQuery,
+    };
+    use lance_index::scalar::inverted::{InvertedIndexParams, InvertedListFormatVersion};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -11753,6 +11762,87 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         assert_eq!(batch.num_rows(), 0);
         assert_query_index_field(&batch);
+    }
+
+    #[rstest]
+    #[case::match_query("match")]
+    #[case::phrase_query("phrase")]
+    #[case::multi_match("multi_match")]
+    #[case::boolean_query("boolean")]
+    #[tokio::test]
+    async fn test_fts_prefilter_covers_all_committed_segments(
+        #[case] query_kind: &str,
+        #[values(InvertedListFormatVersion::V1, InvertedListFormatVersion::V2)]
+        format_version: InvertedListFormatVersion,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .remove_stop_words(false)
+            .format_version(format_version);
+        test_ds
+            .dataset
+            .create_index(&["s"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        test_ds.append_new_data().await.unwrap();
+        test_ds
+            .dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let query = match query_kind {
+            "match" => FtsQuery::Match(MatchQuery::new("s".into())),
+            "phrase" => FtsQuery::Phrase(PhraseQuery::new("s".into())),
+            "multi_match" => FtsQuery::MultiMatch(
+                MultiMatchQuery::try_new("s".into(), vec!["s".into()]).unwrap(),
+            ),
+            "boolean" => FtsQuery::Boolean(
+                BooleanQuery::new([]).with_must(FtsQuery::Match(MatchQuery::new("s".into()))),
+            ),
+            _ => unreachable!("rstest provides a supported query kind"),
+        };
+        for (filter, expected) in [("true", 410), ("i >= 400", 10), ("i < 10", 10)] {
+            let result = test_ds
+                .dataset
+                .scan()
+                .prefilter(true)
+                .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+                .unwrap()
+                .filter(filter)
+                .unwrap()
+                .project(&["i"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(result.num_rows(), expected, "{query_kind}: {filter}");
+        }
+        let scoped_top_k = test_ds
+            .dataset
+            .scan()
+            .prefilter(true)
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap()
+            .filter("i >= 400")
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap()
+            .project(&["i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(scoped_top_k.num_rows(), 3);
+        assert!(
+            scoped_top_k["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .all(|id| *id >= 400)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
